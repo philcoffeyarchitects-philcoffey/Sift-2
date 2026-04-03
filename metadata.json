@@ -1,0 +1,5 @@
+{
+  "name": "Contact Sorter",
+  "description": "Swipe through contacts to categorize them as known, unknown, or unsure.",
+  "requestFramePermissions": []
+}

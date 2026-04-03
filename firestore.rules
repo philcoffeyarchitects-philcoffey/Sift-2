@@ -1,0 +1,56 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function hasOnlyAllowedFields(allowedFields) {
+      return request.resource.data.keys().hasOnly(allowedFields);
+    }
+    
+    function isValidUser() {
+      return hasOnlyAllowedFields(['email', 'createdAt']) &&
+             request.resource.data.email is string &&
+             request.resource.data.createdAt is timestamp;
+    }
+    
+    function isValidContact() {
+      let data = request.resource.data;
+      return hasOnlyAllowedFields(['name', 'company', 'status', 'met', 'notes', 'sourceFile', 'originalData', 'createdAt', 'updatedAt']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 200 &&
+             (!('company' in data) || (data.company is string && data.company.size() < 200)) &&
+             data.status in ['pending', 'keep', 'bin', 'meet', 'park', 'priority'] &&
+             (!('met' in data) || data.met is bool) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() < 5000)) &&
+             (!('sourceFile' in data) || (data.sourceFile is string && data.sourceFile.size() < 500)) &&
+             (!('originalData' in data) || (data.originalData is string && data.originalData.size() < 20000)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser();
+      allow update: if isOwner(userId) && isValidUser() && request.resource.data.createdAt == resource.data.createdAt;
+      
+      match /contacts/{contactId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidContact();
+        allow update: if isOwner(userId) && isValidContact() && request.resource.data.createdAt == resource.data.createdAt;
+        allow delete: if isOwner(userId);
+      }
+    }
+  }
+}
