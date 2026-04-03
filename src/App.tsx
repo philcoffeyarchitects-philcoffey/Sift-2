@@ -1097,8 +1097,8 @@ function SwipeableCard({
 
   const handleDragEnd = (event: any, info: PanInfo) => {
     if (isEditing) return; // Prevent swipe while editing
-    const swipeThreshold = 100;
-    const velocityThreshold = 500;
+    const swipeThreshold = 120;
+    const velocityThreshold = 800;
 
     const isSwipeRight = info.offset.x > swipeThreshold || info.velocity.x > velocityThreshold;
     const isSwipeLeft = info.offset.x < -swipeThreshold || info.velocity.x < -velocityThreshold;
@@ -1144,13 +1144,13 @@ function SwipeableCard({
   return (
     <motion.div
       className={cn(
-        "absolute inset-0 w-full h-full bg-white rounded-3xl shadow-xl border border-gray-200 flex flex-col overflow-hidden origin-bottom",
+        "absolute inset-0 w-full h-full bg-white rounded-3xl shadow-xl border border-gray-200 flex flex-col overflow-hidden origin-bottom touch-none",
         !isTop && "pointer-events-none"
       )}
       style={isTop ? { x, y, rotate } : { scale: 0.95, y: 12, opacity: 0.9 }}
       drag={isTop && !isEditing ? true : false}
       dragConstraints={{ left: 0, right: 0, top: 0, bottom: 0 }}
-      dragElastic={0.9}
+      dragElastic={0.6}
       onDragEnd={handleDragEnd}
       whileTap={{ cursor: 'grabbing' }}
       initial={isTop ? { scale: 0.95, y: 20, opacity: 0 } : false}
