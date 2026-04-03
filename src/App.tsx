@@ -5,7 +5,7 @@ import { Upload, Download, Check, X, HelpCircle, Building2, User, ChevronRight, 
 import { cn } from './lib/utils';
 import { auth, db, signIn, logOut } from './firebase';
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
-import { collection, doc, writeBatch, onSnapshot, query, serverTimestamp, updateDoc, deleteDoc, getDocs } from 'firebase/firestore';
+import { collection, doc, writeBatch, onSnapshot, query, serverTimestamp, updateDoc, deleteDoc, getDocs, getDocsFromCache, getDocsFromServer } from 'firebase/firestore';
 
 type Decision = 'pending' | 'keep' | 'bin' | 'meet' | 'park' | 'priority';
 
@@ -13,6 +13,7 @@ type Contact = {
   id: string;
   name: string;
   company: string;
+  email?: string;
   status: Decision;
   met?: boolean;
   notes?: string;
@@ -30,7 +31,10 @@ export default function App() {
   const [history, setHistory] = useState<string[]>([]); // Stack of contact IDs for undo
   const [activeFilter, setActiveFilter] = useState<string>('all');
   const [isUploading, setIsUploading] = useState(false);
-  
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [hasInitialLoad, setHasInitialLoad] = useState(false);
+
   // Note Bottom Sheet State
   const [isNoteSheetOpen, setIsNoteSheetOpen] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
@@ -38,21 +42,33 @@ export default function App() {
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setIsAuthReady(true);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  useEffect(() => {
-    if (!isAuthReady || !user) return;
-
-    const contactsRef = collection(db, 'users', user.uid, 'contacts');
-    const q = query(contactsRef);
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
+  const fetchContacts = async () => {
+    if (!user) return;
+    setIsRefreshing(true);
+    setFetchError(null);
+    try {
+      const contactsRef = collection(db, 'users', user.uid, 'contacts');
+      const q = query(contactsRef);
+      
+      let snapshot;
+      try {
+        // Try server first
+        snapshot = await getDocsFromServer(q);
+      } catch (serverError: any) {
+        console.warn("Server fetch failed, trying cache:", serverError);
+        // Fallback to cache if server fails (e.g. quota exceeded)
+        try {
+          snapshot = await getDocsFromCache(q);
+          if (snapshot.empty) {
+            // If cache is also empty, re-throw the server error to show the UI
+            throw serverError;
+          }
+        } catch (cacheError) {
+          // If cache fetch also fails, throw the original server error
+          throw serverError;
+        }
+      }
+      
       const allContacts: Contact[] = [];
       snapshot.forEach((doc) => {
         allContacts.push({ id: doc.id, ...doc.data() } as Contact);
@@ -66,15 +82,26 @@ export default function App() {
       });
 
       setContacts(allContacts);
-      setIsQuotaExceeded(false);
-    }, (error) => {
-      console.error("Firestore Error: ", error);
-      if (error?.code === 'resource-exhausted' || error?.message?.includes('Quota exceeded')) {
-        setIsQuotaExceeded(true);
-      }
-    });
+    } catch (error: any) {
+      console.error("Firestore Fetch Error: ", error);
+      setFetchError(error?.message || "Failed to load contacts");
+    } finally {
+      setIsRefreshing(false);
+      setHasInitialLoad(true);
+    }
+  };
 
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setIsAuthReady(true);
+    });
     return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthReady || !user) return;
+    fetchContacts();
   }, [user, isAuthReady]);
 
   const sourceFiles = Array.from(new Set(contacts.map(c => c.sourceFile).filter(Boolean))) as string[];
@@ -108,6 +135,7 @@ export default function App() {
             const keys = Object.keys(results.data[0] as object);
             const nameKey = keys.find(k => /name|first/i.test(k)) || keys[0];
             const companyKey = keys.find(k => /company|org|account/i.test(k)) || (keys.length > 1 ? keys[1] : null);
+            const emailKey = keys.find(k => /email|mail/i.test(k));
 
             try {
               const contactsRef = collection(db, 'users', user.uid, 'contacts');
@@ -115,13 +143,24 @@ export default function App() {
               let currentBatch = writeBatch(db);
               let operationCount = 0;
 
+              // Create a set of existing emails for fast lookup
+              const existingEmails = new Set(contacts.map(c => c.email?.toLowerCase()).filter(Boolean));
+
               for (let j = 0; j < results.data.length; j++) {
                 const row: any = results.data[j];
+                const email = emailKey && row[emailKey] ? String(row[emailKey]).trim().toLowerCase() : null;
+
+                // Skip if email already exists
+                if (email && existingEmails.has(email)) {
+                  continue;
+                }
+
                 const newDocRef = doc(contactsRef);
                 
                 const contactData = {
                   name: row[nameKey] ? String(row[nameKey]).trim() : 'Unknown Name',
                   company: companyKey && row[companyKey] ? String(row[companyKey]).trim() : '',
+                  email: email || '',
                   status: 'pending',
                   sourceFile: file.name,
                   originalData: JSON.stringify(row),
@@ -144,7 +183,8 @@ export default function App() {
               }
 
               await Promise.all(batches);
-            } catch (error) {
+              await fetchContacts();
+            } catch (error: any) {
               console.error("Error uploading contacts:", error);
             } finally {
               resolve();
@@ -170,7 +210,7 @@ export default function App() {
         ...updates,
         updatedAt: serverTimestamp()
       });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error updating contact:", error);
     }
   };
@@ -178,16 +218,21 @@ export default function App() {
   const handleDecision = async (decision: Decision) => {
     if (!currentContact || !user) return;
     
+    const contactId = currentContact.id;
+    
+    // Optimistic update
+    setContacts(prev => prev.map(c => c.id === contactId ? { ...c, status: decision } : c));
+    setHistory(prev => [...prev, contactId]);
+
     try {
-      const contactRef = doc(db, 'users', user.uid, 'contacts', currentContact.id);
+      const contactRef = doc(db, 'users', user.uid, 'contacts', contactId);
       await updateDoc(contactRef, {
         status: decision,
         updatedAt: serverTimestamp()
       });
-      
-      setHistory(prev => [...prev, currentContact.id]);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error updating contact:", error);
+      fetchContacts(); // Revert on error
     }
   };
 
@@ -195,43 +240,63 @@ export default function App() {
     if (history.length === 0 || !user) return;
     
     const lastId = history[history.length - 1];
+    
+    // Optimistic update
+    setContacts(prev => prev.map(c => c.id === lastId ? { ...c, status: 'pending' } : c));
+    setHistory(prev => prev.slice(0, -1));
+
     try {
       const contactRef = doc(db, 'users', user.uid, 'contacts', lastId);
       await updateDoc(contactRef, {
         status: 'pending',
         updatedAt: serverTimestamp()
       });
-      
-      setHistory(prev => prev.slice(0, -1));
-    } catch (error) {
-      console.error("Error undoing:", error);
+    } catch (error: any) {
+      console.error("Error undoing decision:", error);
+      fetchContacts(); // Revert on error
     }
   };
 
   const toggleMet = async () => {
     if (!currentContact || !user) return;
+    
+    const contactId = currentContact.id;
+    const newMet = !currentContact.met;
+    
+    // Optimistic update
+    setContacts(prev => prev.map(c => c.id === contactId ? { ...c, met: newMet } : c));
+
     try {
-      const contactRef = doc(db, 'users', user.uid, 'contacts', currentContact.id);
+      const contactRef = doc(db, 'users', user.uid, 'contacts', contactId);
       await updateDoc(contactRef, {
-        met: !currentContact.met,
+        met: newMet,
         updatedAt: serverTimestamp()
       });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error toggling met:", error);
+      fetchContacts(); // Revert on error
     }
   };
 
   const saveNote = async () => {
     if (!currentContact || !user) return;
+    
+    const contactId = currentContact.id;
+    const note = currentNote;
+    
+    // Optimistic update
+    setContacts(prev => prev.map(c => c.id === contactId ? { ...c, notes: note } : c));
+    setIsNoteSheetOpen(false);
+
     try {
-      const contactRef = doc(db, 'users', user.uid, 'contacts', currentContact.id);
+      const contactRef = doc(db, 'users', user.uid, 'contacts', contactId);
       await updateDoc(contactRef, {
-        notes: currentNote,
+        notes: note,
         updatedAt: serverTimestamp()
       });
-      setIsNoteSheetOpen(false);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error saving note:", error);
+      fetchContacts(); // Revert on error
     }
   };
 
@@ -268,7 +333,8 @@ export default function App() {
       }
 
       await Promise.all(batches);
-    } catch (error) {
+      await fetchContacts();
+    } catch (error: any) {
       console.error("Error reviewing parked:", error);
     }
   };
@@ -277,7 +343,6 @@ export default function App() {
   const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
   const [exportCsvText, setExportCsvText] = useState("");
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
-  const [isQuotaExceeded, setIsQuotaExceeded] = useState(false);
 
   const clearData = async (scope: 'all' | 'current') => {
     if (!user) return;
@@ -331,7 +396,8 @@ export default function App() {
         }
         await Promise.all(batches);
       }
-
+      
+      await fetchContacts();
       setIsClearConfirmOpen(false);
       setIsHistoryOpen(false);
       setHistory([]);
@@ -339,7 +405,7 @@ export default function App() {
         setActiveFilter('all');
       }
       alert(scope === 'all' ? "All data cleared successfully." : `Data for "${activeFilter}" cleared successfully.`);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error clearing data:", error);
       alert("Failed to clear data. Please try again.");
     }
@@ -472,40 +538,6 @@ export default function App() {
     }
   };
 
-  if (isQuotaExceeded) {
-    return (
-      <div className="h-[100dvh] bg-gray-50 flex flex-col items-center justify-center p-8 text-center font-sans">
-        <div className="w-20 h-20 bg-amber-100 rounded-full flex items-center justify-center mb-6">
-          <AlertCircle className="w-10 h-10 text-amber-600" />
-        </div>
-        <h2 className="text-2xl font-bold mb-4">Daily Limit Reached</h2>
-        <p className="text-gray-600 mb-8 leading-relaxed">
-          The database has reached its free daily limit for writes. This usually happens after importing very large files.
-        </p>
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 w-full max-w-sm text-left space-y-4">
-          <div className="flex gap-3">
-            <div className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center shrink-0 text-xs font-bold">1</div>
-            <p className="text-sm text-gray-700">The limit will <strong>reset automatically</strong> in a few hours (at midnight US Pacific Time).</p>
-          </div>
-          <div className="flex gap-3">
-            <div className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center shrink-0 text-xs font-bold">2</div>
-            <p className="text-sm text-gray-700">Your existing decisions are <strong>safe</strong> and haven't been lost.</p>
-          </div>
-          <div className="flex gap-3">
-            <div className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center shrink-0 text-xs font-bold">3</div>
-            <p className="text-sm text-gray-700">Try using smaller CSV files (under 1,000 rows) to stay within the free tier.</p>
-          </div>
-        </div>
-        <button 
-          onClick={() => window.location.reload()}
-          className="mt-8 text-indigo-600 font-bold hover:underline"
-        >
-          Tap to Refresh
-        </button>
-      </div>
-    );
-  }
-
   if (!isAuthReady) {
     return <div className="min-h-[100dvh] bg-gray-50 flex items-center justify-center">Loading...</div>;
   }
@@ -570,6 +602,14 @@ export default function App() {
                 {sourceFiles.map(f => <option key={f} value={f}>{f}</option>)}
               </select>
               <button 
+                onClick={fetchContacts}
+                disabled={isRefreshing}
+                className={cn("p-1 text-indigo-600 hover:bg-indigo-50 rounded-full transition-colors", isRefreshing && "animate-spin")}
+                title="Refresh data"
+              >
+                <RotateCcw className="w-4 h-4" />
+              </button>
+              <button 
                 onClick={() => fileInputRef.current?.click()}
                 className="p-1 text-indigo-600 hover:bg-indigo-50 rounded-full transition-colors"
                 title="Import another CSV"
@@ -606,7 +646,37 @@ export default function App() {
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col relative w-full overflow-hidden">
         
-        {contacts.length === 0 ? (
+        {!hasInitialLoad && isRefreshing && contacts.length === 0 ? (
+          <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
+            <div className="w-16 h-16 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mb-6"></div>
+            <h2 className="text-xl font-bold mb-2">Checking for existing data...</h2>
+            <p className="text-gray-500">Please wait a moment while we sync with Firestore.</p>
+          </div>
+        ) : fetchError ? (
+          <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
+            <div className="w-20 h-20 bg-red-100 rounded-full flex items-center justify-center mb-6">
+              <AlertCircle className="w-10 h-10 text-red-600" />
+            </div>
+            <h2 className="text-2xl font-bold mb-3 tracking-tight">Failed to Load Data</h2>
+            <p className="text-gray-500 mb-8 max-w-xs mx-auto">
+              {fetchError.includes('Quota exceeded') 
+                ? "The database has reached its free limit. If you've upgraded to Blaze, this might take a moment to propagate."
+                : "There was an error fetching your contacts. Please check your connection and try again."}
+            </p>
+            <button 
+              onClick={fetchContacts}
+              disabled={isRefreshing}
+              className="w-full max-w-xs bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-4 px-6 rounded-2xl shadow-lg transition-colors flex items-center justify-center gap-3 text-lg"
+            >
+              {isRefreshing ? <span className="animate-pulse">Refreshing...</span> : "Try Again"}
+            </button>
+            <div className="mt-8 flex items-center gap-6">
+              <button onClick={logOut} className="text-gray-400 font-medium flex items-center gap-2">
+                 <LogOut className="w-4 h-4" /> Sign Out
+              </button>
+            </div>
+          </div>
+        ) : contacts.length === 0 ? (
           <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
             <div className="w-24 h-24 bg-indigo-100 rounded-full flex items-center justify-center mb-6">
               <Upload className="w-12 h-12 text-indigo-600" />
@@ -630,6 +700,16 @@ export default function App() {
                 </>
               )}
             </button>
+
+            <button 
+              onClick={fetchContacts}
+              disabled={isRefreshing}
+              className="w-full mt-4 bg-white border-2 border-indigo-600 text-indigo-600 font-bold py-4 px-6 rounded-2xl shadow-sm transition-colors flex items-center justify-center gap-3 text-lg"
+            >
+              <RotateCcw className={cn("w-6 h-6", isRefreshing && "animate-spin")} />
+              Check for Existing Data
+            </button>
+
             <div className="mt-8 flex items-center gap-6">
               <button onClick={() => setIsClearConfirmOpen(true)} className="text-red-500 font-medium flex items-center gap-2">
                  <RotateCcw className="w-4 h-4" /> Clear All Data
@@ -688,15 +768,15 @@ export default function App() {
               {filteredPending.slice(0, 2).reverse().map((contact, idx) => {
                 const isTop = idx === filteredPending.slice(0, 2).length - 1;
                 return (
-                <SwipeableCard 
-                  key={currentContact.id}
-                  contact={currentContact} 
-                  isTop={true} 
-                  onDecision={handleDecision}
-                  onUpdate={(updates) => updateContact(currentContact.id, updates)}
-                  isEditing={isEditing}
-                  setIsEditing={setIsEditing}
-                />
+                  <SwipeableCard 
+                    key={contact.id}
+                    contact={contact} 
+                    isTop={isTop} 
+                    onDecision={handleDecision}
+                    onUpdate={(updates) => updateContact(contact.id, updates)}
+                    isEditing={isEditing}
+                    setIsEditing={setIsEditing}
+                  />
                 );
               })}
             </div>
