@@ -7,20 +7,29 @@ import { auth, db, signIn, logOut } from './firebase';
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { collection, doc, writeBatch, onSnapshot, query, serverTimestamp, updateDoc, deleteDoc, getDocs, getDocsFromCache, getDocsFromServer } from 'firebase/firestore';
 
-type Decision = 'pending' | 'keep' | 'bin' | 'meet' | 'park' | 'priority';
+type PrimaryCategory = 'pending' | 'Client' | 'Architect' | 'Consultant' | 'Friend & Family' | 'Don\'t Know';
 
 type Contact = {
   id: string;
   name: string;
   company: string;
   email?: string;
-  status: Decision;
+  status: PrimaryCategory;
+  subStatus?: string;
   met?: boolean;
   notes?: string;
   sourceFile?: string;
   originalData: string;
   createdAt?: any;
   updatedAt?: any;
+};
+
+const SUBCATEGORIES: Record<Exclude<PrimaryCategory, 'pending'>, string[]> = {
+  'Client': ['Commercial', 'Culture', 'High End Resi', 'Hospitality', 'Housing', 'Mixed Use', 'Prime Resi', 'Private Client', 'Other'],
+  'Consultant': ['Agent', 'Planning Consultant', 'Project Manager', 'Quantity Surveyor', 'Service Engineer', 'Structural Engineer', 'Multi Dis', 'Other'],
+  'Architect': ['Small', 'Medium', 'Large'],
+  'Friend & Family': ['Friend', 'Family'],
+  'Don\'t Know': ['Unknown']
 };
 
 export default function App() {
@@ -34,6 +43,7 @@ export default function App() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [hasInitialLoad, setHasInitialLoad] = useState(false);
+  const [selectedPrimary, setSelectedPrimary] = useState<PrimaryCategory | null>(null);
 
   // Note Bottom Sheet State
   const [isNoteSheetOpen, setIsNoteSheetOpen] = useState(false);
@@ -215,19 +225,21 @@ export default function App() {
     }
   };
 
-  const handleDecision = async (decision: Decision) => {
+  const handleDecision = async (primary: PrimaryCategory, secondary: string) => {
     if (!currentContact || !user) return;
     
     const contactId = currentContact.id;
     
     // Optimistic update
-    setContacts(prev => prev.map(c => c.id === contactId ? { ...c, status: decision } : c));
+    setContacts(prev => prev.map(c => c.id === contactId ? { ...c, status: primary, subStatus: secondary } : c));
     setHistory(prev => [...prev, contactId]);
+    setSelectedPrimary(null);
 
     try {
       const contactRef = doc(db, 'users', user.uid, 'contacts', contactId);
       await updateDoc(contactRef, {
-        status: decision,
+        status: primary,
+        subStatus: secondary,
         updatedAt: serverTimestamp()
       });
     } catch (error: any) {
@@ -242,13 +254,15 @@ export default function App() {
     const lastId = history[history.length - 1];
     
     // Optimistic update
-    setContacts(prev => prev.map(c => c.id === lastId ? { ...c, status: 'pending' } : c));
+    setContacts(prev => prev.map(c => c.id === lastId ? { ...c, status: 'pending', subStatus: '' } : c));
     setHistory(prev => prev.slice(0, -1));
+    setSelectedPrimary(null);
 
     try {
       const contactRef = doc(db, 'users', user.uid, 'contacts', lastId);
       await updateDoc(contactRef, {
         status: 'pending',
+        subStatus: '',
         updatedAt: serverTimestamp()
       });
     } catch (error: any) {
@@ -426,7 +440,8 @@ export default function App() {
         
         return {
           ...original,
-          Decision: c.status === 'meet' ? 'MET' : c.status.toUpperCase(),
+          Category: c.status === 'pending' ? '' : c.status,
+          'Sub-Category': c.subStatus || '',
           Met: c.met ? 'Yes' : '',
           'Triage Notes': c.notes || ''
         };
@@ -564,11 +579,11 @@ export default function App() {
   }
 
   const stats = {
-    keep: contacts.filter(c => c.status === 'keep').length,
-    bin: contacts.filter(c => c.status === 'bin').length,
-    meet: contacts.filter(c => c.status === 'meet').length,
-    park: contacts.filter(c => c.status === 'park').length,
-    priority: contacts.filter(c => c.status === 'priority').length,
+    client: contacts.filter(c => c.status === 'Client').length,
+    architect: contacts.filter(c => c.status === 'Architect').length,
+    consultant: contacts.filter(c => c.status === 'Consultant').length,
+    friendFamily: contacts.filter(c => c.status === 'Friend & Family').length,
+    dontKnow: contacts.filter(c => c.status === 'Don\'t Know').length,
     pending: contacts.filter(c => c.status === 'pending').length,
   };
 
@@ -634,11 +649,11 @@ export default function App() {
 
           {/* Stats Row */}
           <div className="flex items-center justify-between px-4 py-2 bg-gray-50/50 text-[10px] font-bold uppercase tracking-wider">
-            <div className="flex flex-col items-center text-green-600"><span className="text-sm">{stats.keep}</span> Keep</div>
-            <div className="flex flex-col items-center text-red-600"><span className="text-sm">{stats.bin}</span> Bin</div>
-            <div className="flex flex-col items-center text-blue-600"><span className="text-sm">{stats.meet}</span> Met</div>
-            <div className="flex flex-col items-center text-amber-600"><span className="text-sm">{stats.park}</span> Park</div>
-            <div className="flex flex-col items-center text-purple-600"><span className="text-sm">{stats.priority}</span> Priority</div>
+            <div className="flex flex-col items-center text-blue-600"><span className="text-sm">{stats.client}</span> Client</div>
+            <div className="flex flex-col items-center text-purple-600"><span className="text-sm">{stats.architect}</span> Architect</div>
+            <div className="flex flex-col items-center text-orange-600"><span className="text-sm">{stats.consultant}</span> Consultant</div>
+            <div className="flex flex-col items-center text-green-600"><span className="text-sm">{stats.friendFamily}</span> Friend/Fam</div>
+            <div className="flex flex-col items-center text-gray-600"><span className="text-sm">{stats.dontKnow}</span> ?</div>
           </div>
         </div>
       )}
@@ -750,15 +765,6 @@ export default function App() {
               >
                 <Upload className="w-6 h-6" /> Import Another CSV
               </button>
-              
-              {stats.park > 0 && (
-                <button 
-                  onClick={reviewParked}
-                  className="w-full bg-amber-100 text-amber-800 font-bold py-4 px-6 rounded-2xl shadow-sm transition-colors flex items-center justify-center gap-2 text-lg"
-                >
-                  <RotateCcw className="w-6 h-6" /> Review {stats.park} Parked
-                </button>
-              )}
             </div>
           </div>
         ) : (
@@ -768,11 +774,10 @@ export default function App() {
               {filteredPending.slice(0, 2).reverse().map((contact, idx) => {
                 const isTop = idx === filteredPending.slice(0, 2).length - 1;
                 return (
-                  <SwipeableCard 
+                  <ContactCard 
                     key={contact.id}
                     contact={contact} 
                     isTop={isTop} 
-                    onDecision={handleDecision}
                     onUpdate={(updates) => updateContact(contact.id, updates)}
                     isEditing={isEditing}
                     setIsEditing={setIsEditing}
@@ -781,14 +786,36 @@ export default function App() {
               })}
             </div>
 
-            {/* Action Buttons (5 main buttons) */}
+            {/* Action Buttons */}
             {!isEditing && (
-              <div className="flex items-center justify-between w-full px-2 pb-4">
-                <ActionButton icon={<X />} color="text-red-500" bg="bg-red-50" border="border-red-100" onClick={() => handleDecision('bin')} />
-                <ActionButton icon={<Pause />} color="text-amber-500" bg="bg-amber-50" border="border-amber-100" onClick={() => handleDecision('park')} />
-                <ActionButton icon={<Star />} color="text-purple-500" bg="bg-purple-50" border="border-purple-100" onClick={() => handleDecision('priority')} />
-                <ActionButton icon={<MapPin />} color="text-blue-500" bg="bg-blue-50" border="border-blue-100" onClick={() => handleDecision('meet')} />
-                <ActionButton icon={<Check />} color="text-green-500" bg="bg-green-50" border="border-green-100" onClick={() => handleDecision('keep')} />
+              <div className="w-full px-2 pb-4">
+                {!selectedPrimary ? (
+                  <div className="grid grid-cols-2 gap-3">
+                    <button onClick={() => setSelectedPrimary('Client')} className="bg-blue-50 text-blue-700 border-2 border-blue-200 font-bold py-4 rounded-2xl active:scale-95 transition-transform">Client</button>
+                    <button onClick={() => setSelectedPrimary('Architect')} className="bg-purple-50 text-purple-700 border-2 border-purple-200 font-bold py-4 rounded-2xl active:scale-95 transition-transform">Architect</button>
+                    <button onClick={() => setSelectedPrimary('Consultant')} className="bg-orange-50 text-orange-700 border-2 border-orange-200 font-bold py-4 rounded-2xl active:scale-95 transition-transform">Consultant</button>
+                    <button onClick={() => setSelectedPrimary('Friend & Family')} className="bg-green-50 text-green-700 border-2 border-green-200 font-bold py-4 rounded-2xl active:scale-95 transition-transform">Friend & Family</button>
+                    <button onClick={() => setSelectedPrimary('Don\'t Know')} className="col-span-2 bg-gray-50 text-gray-700 border-2 border-gray-200 font-bold py-4 rounded-2xl active:scale-95 transition-transform">Don't Know</button>
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-3">
+                    <div className="flex items-center justify-between mb-1 px-1">
+                      <span className="font-bold text-gray-700">{selectedPrimary} Type:</span>
+                      <button onClick={() => setSelectedPrimary(null)} className="text-sm text-gray-500 font-bold bg-gray-100 px-3 py-1 rounded-full active:scale-95 transition-transform">Back</button>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {SUBCATEGORIES[selectedPrimary].map(sub => (
+                        <button 
+                          key={sub}
+                          onClick={() => handleDecision(selectedPrimary, sub)}
+                          className="bg-indigo-50 text-indigo-700 border border-indigo-200 font-medium py-2 px-4 rounded-xl flex-grow text-center active:scale-95 transition-transform"
+                        >
+                          {sub}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1005,15 +1032,15 @@ export default function App() {
                       <div className="font-bold truncate">{contact.name}</div>
                       <div className="text-xs text-gray-500 truncate">{contact.company}</div>
                     </div>
-                    <div className={cn(
-                      "px-2 py-1 rounded-lg text-[10px] font-black uppercase",
-                      contact.status === 'keep' ? "bg-green-100 text-green-700" :
-                      contact.status === 'bin' ? "bg-red-100 text-red-700" :
-                      contact.status === 'meet' ? "bg-blue-100 text-blue-700" :
-                      contact.status === 'park' ? "bg-amber-100 text-amber-700" :
-                      "bg-purple-100 text-purple-700"
-                    )}>
-                      {contact.status === 'meet' ? 'MET' : contact.status}
+                    <div className="text-right">
+                      <div className="px-2 py-1 rounded-lg text-[10px] font-black uppercase bg-indigo-100 text-indigo-700 inline-block">
+                        {contact.status}
+                      </div>
+                      {contact.subStatus && (
+                        <div className="text-[10px] text-gray-500 mt-1 font-medium">
+                          {contact.subStatus}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))
@@ -1054,26 +1081,20 @@ function ActionButton({ icon, color, bg, border, onClick }: { icon: React.ReactN
   );
 }
 
-function SwipeableCard({ 
+function ContactCard({ 
   contact, 
   isTop, 
-  onDecision,
   onUpdate,
   isEditing,
   setIsEditing
 }: { 
   contact: Contact; 
   isTop: boolean;
-  onDecision: (decision: Decision) => void | Promise<void>;
   onUpdate?: (updates: Partial<Contact>) => void | Promise<void>;
   isEditing: boolean;
   setIsEditing: (val: boolean) => void;
   key?: any;
 }) {
-  const x = useMotionValue(0);
-  const y = useMotionValue(0);
-  const rotate = useTransform(x, [-200, 200], [-10, 10]);
-  
   const [editName, setEditName] = useState(contact.name);
   const [editCompany, setEditCompany] = useState(contact.company);
 
@@ -1088,29 +1109,6 @@ function SwipeableCard({
       onUpdate({ name: editName, company: editCompany });
     }
     setIsEditing(false);
-  };
-
-  // Indicators opacity
-  const nopeOpacity = useTransform(x, [-100, -50, 0], [1, 0, 0]);
-  const likeOpacity = useTransform(x, [0, 50, 100], [0, 0, 1]);
-  const meetOpacity = useTransform(y, [-100, -50, 0], [1, 0, 0]);
-
-  const handleDragEnd = (event: any, info: PanInfo) => {
-    if (isEditing) return; // Prevent swipe while editing
-    const swipeThreshold = 120;
-    const velocityThreshold = 800;
-
-    const isSwipeRight = info.offset.x > swipeThreshold || info.velocity.x > velocityThreshold;
-    const isSwipeLeft = info.offset.x < -swipeThreshold || info.velocity.x < -velocityThreshold;
-    const isSwipeUp = info.offset.y < -swipeThreshold || info.velocity.y < -velocityThreshold;
-
-    if (isSwipeRight) {
-      onDecision('keep');
-    } else if (isSwipeLeft) {
-      onDecision('bin');
-    } else if (isSwipeUp && Math.abs(info.offset.y) > Math.abs(info.offset.x)) {
-      onDecision('meet');
-    }
   };
 
   // Extract details from originalData
@@ -1144,43 +1142,14 @@ function SwipeableCard({
   return (
     <motion.div
       className={cn(
-        "absolute inset-0 w-full h-full bg-white rounded-3xl shadow-xl border border-gray-200 flex flex-col overflow-hidden origin-bottom touch-none",
+        "absolute inset-0 w-full h-full bg-white rounded-3xl shadow-xl border border-gray-200 flex flex-col overflow-hidden origin-bottom",
         !isTop && "pointer-events-none"
       )}
-      style={isTop ? { x, y, rotate } : { scale: 0.95, y: 12, opacity: 0.9 }}
-      drag={isTop && !isEditing ? true : false}
-      dragConstraints={{ left: 0, right: 0, top: 0, bottom: 0 }}
-      dragElastic={0.6}
-      onDragEnd={handleDragEnd}
-      whileTap={{ cursor: 'grabbing' }}
+      style={isTop ? {} : { scale: 0.95, y: 12, opacity: 0.9 }}
       initial={isTop ? { scale: 0.95, y: 20, opacity: 0 } : false}
       animate={{ scale: 1, y: 0, opacity: 1 }}
       transition={{ type: 'spring', stiffness: 300, damping: 25 }}
     >
-      {/* Swipe Indicators */}
-      {!isEditing && (
-        <>
-          <motion.div 
-            className="absolute top-10 right-6 border-4 border-green-500 text-green-500 font-black text-4xl px-4 py-1 rounded-xl rotate-12 z-20 bg-white/80 backdrop-blur-sm"
-            style={{ opacity: likeOpacity }}
-          >
-            KEEP ✓
-          </motion.div>
-          <motion.div 
-            className="absolute top-10 left-6 border-4 border-red-500 text-red-500 font-black text-4xl px-4 py-1 rounded-xl -rotate-12 z-20 bg-white/80 backdrop-blur-sm"
-            style={{ opacity: nopeOpacity }}
-          >
-            BIN ✗
-          </motion.div>
-          <motion.div 
-            className="absolute bottom-1/4 left-1/2 -translate-x-1/2 border-4 border-blue-500 text-blue-500 font-black text-4xl px-4 py-1 rounded-xl z-20 bg-white/80 backdrop-blur-sm"
-            style={{ opacity: meetOpacity }}
-          >
-            MET ↑
-          </motion.div>
-        </>
-      )}
-
       {/* Card Content */}
       <div className="flex-1 flex flex-col p-6 overflow-y-auto hide-scrollbar">
         
